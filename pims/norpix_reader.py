@@ -3,6 +3,8 @@
 Author: Nathan C. Keim
 Based heavily on cine.py by Kleckner and Caswell
 """
+from PIL import Image
+import io
 
 from pims.frame import Frame
 from pims.base_frames import FramesSequence, index_attr
@@ -20,6 +22,7 @@ __all__ = [
 DWORD = "L"  # 4 bytes
 UINT = "I"  # 4 bytes
 LONG = "l"  # 4 bytes
+LONGLONG = "q"  # 8 bytes
 DOUBLE = "d"  # 8 bytes
 USHORT = "H"  # 2 bytes
 SHORT = "h"  # 2 bytes
@@ -57,7 +60,7 @@ HEADER_FIELDS = [
     ("jpeg_quality", USHORT),
     ("jpeg_lossless", UINT),
     ("h264_decode_format", DWORD),  # 'eHImageFormat enum', H264 decode format
-    ("index_offset", DOUBLE),  # 'long long', offset of compression index data
+    ("index_offset", LONGLONG),  # 'long long', offset of compression index data
     # 'long', oldest_frame_index will be > 0 if loop recording into circular buffer
     ("oldest_frame_index", LONG),
     ("bytes_alignment", LONG)  # 'long', image alignment (for uncompressed sequences)
@@ -78,7 +81,7 @@ EHCOMPRESSION = {
     9: "H_COMPRESSION_WAVELET",  # Not implemented yet!
 }
 
-# Enum for possible h264 decode formats
+# Enum for possible image formats
 EHIMAGEFORMAT = {
     0: "H_IMAGE_UNKNOWN",
     100: "H_IMAGE_MONO",
@@ -399,7 +402,7 @@ class NorpixJPEGSeq(FramesSequence):
         "frame_rate",
     ]
 
-    def __init__(self, filename, as_raw=False):
+    def __init__(self, filename):
         super(NorpixJPEGSeq, self).__init__()
         self._file = open(filename, "rb")
         self._filename = filename
@@ -413,14 +416,15 @@ class NorpixJPEGSeq(FramesSequence):
             != "H_COMPRESSION_JPEG"
         ):
             raise IOError("This reader only supports JPEG compressed frames")
-        if self.header_dict["image_format"] != 100 and not as_raw:
+        if self.header_dict["image_format"] not in EHIMAGEFORMAT.keys():
             raise IOError(
-                "Non-monochrome images are only supported as_raw in .seq files"
+                f"Detected image format {self.header_dict['image_format']}; "
+                f"this is not supported"
             )
 
         # File-level metadata
         if self.header_dict["version"] >= 5:  # StreamPix version 6
-            self._image_offset = 8192  # Frame data is stored on aligned 8k boundaries
+            self._image_offset = 1024  # Frame data is stored on aligned 8k boundaries => NO APPEARS 1024 FOR JPEG?!
             # Timestamp = 4-byte unsigned long + 2-byte unsigned short (ms)
             #   + 2-byte unsigned short (us)
             self._timestamp_struct = struct.Struct("<LHH")
@@ -432,35 +436,29 @@ class NorpixJPEGSeq(FramesSequence):
         self._image_block_size = self.header_dict["true_image_size"]
         self._filesize = os.stat(self._filename).st_size
 
-        self._frame_idx = self.prepare_sequence_index()
-        # todo read or reconstruct .idx file first
-        # self._image_count = int(
-        #     (self._filesize - self._image_offset) / self._image_block_size
-        # )
+        self._sequence_index = self._prepare_sequence_index()
+        self._image_count = len(self._sequence_index)
 
         # Image metadata
         self._width = self.header_dict["width"]
         self._height = self.header_dict["height"]
-        self._image_bytes = self.header_dict["image_size_bytes"] # is image size of uncompressed image!
+        # NOTE: this is the size in bytes of the uncompressed image!
+        self._image_bytes = self.header_dict["image_size_bytes"]
 
         # todo adapt to reading JPEG data; can't simply infer from raw byte counts etc.
-        if as_raw:
-            self._pixel_count = self._image_bytes
-            if self._pixel_count % self._height == 0:
-                self._shape = (self._height, int(self._pixel_count / self._height))
-            else:
-                self._shape = (self._image_bytes,)
-            self._dtype = "uint8"
-        else:
-            try:
-                self._pixel_count = self._width * self._height
-                dtype_native = "uint%i" % self.header_dict["bit_depth"]
-                self._dtype = np.dtype(dtype_native)
-                self._shape = (self._height, self._width)
-            except TypeError as e:
-                raise IOError(
-                    self._dtype + " pixels not supported; use as_raw and convert"
-                )
+        try:
+            self._pixel_count = self._width * self._height
+            dtype_native = "uint%i" % self.header_dict["bit_depth_real"]
+            self._dtype = np.dtype(dtype_native)
+            self._shape = (
+                self._height,
+                self._width,
+                self._image_bytes // self._pixel_count,
+            )
+        except TypeError as e:
+            raise NotImplementedError(
+                self._dtype + " bit depth pixels not supported yet"
+            )
 
         # Public metadata
         self.metadata = {
@@ -479,6 +477,92 @@ class NorpixJPEGSeq(FramesSequence):
 
         self._file_lock = Lock()
 
+    def _prepare_sequence_index(self):
+        """Read the .idx file, if it exists, and return a list of frame offsets"""
+        idx_filename = self._filename + ".idx"
+        if os.path.exists(idx_filename):
+            self._idx_file = open(idx_filename, "rb")
+
+            # a .idx file contains 20-byte chunks for each frame in the .seq file
+            # LOL NO IT DOESN'T?!
+            # turns out the chunks are 24 bytes long...
+            fields = (
+                ("offset", LONGLONG),  # 8 bytes
+                ("image_size", LONG),  # 4 bytes = sums to 12
+                ("timestamp", LONG),  # 4 bytes = sums to 16
+                ("timestamp_ms", SHORT),  # 2 bytes = sums to 18
+                ("timestamp_us", SHORT),  # 2 bytes = sums to 20
+                ("whatever_this_is", LONG),  # 4 bytes = sums to 24
+            )
+
+            # seek to 0, read & unpack consecutive 20-byte chunks until end of file
+            self._idx_file.seek(0)
+            return [
+                chunk
+                for chunk in self._yield_idx_chunks(file=self._idx_file, fields=fields)
+            ]
+        # if it doesn't exist, we'll have to read the whole file and reconstruct it.
+        else:
+            return [chunk for chunk in self._reconstruct_sequence_index()]
+
+    def _reconstruct_sequence_index(self):
+        """
+        If there's no .idx file, reconstruct its contents by scanning the .seq file
+
+        JPEG data blocks are 4 bytes "JPEG data size + 4", the actual JPEG data,
+        and then 8 bytes with the timestamp
+
+        Will return a dict with the offset where a new data block starts,
+        the size of the JPEG data block, and the timestamp
+        """
+        filesize = os.stat(self._filename).st_size
+
+        # seek _file to 0 + header size
+        self._file.seek(self._image_offset)
+        # now iteratively read the first 4 bytes to get compressed image data size + 4
+
+        while self._file.tell() < filesize:
+            to_return = {}
+            # get offset where this data block starts
+            to_return["offset"] = self._file.tell()
+
+            # read 4 bytes to get compressed image data size + 4; store actual image size
+            image_size = (
+                struct.unpack("<L", self._file.read(4))[0] - 4
+            )  # SHREK IS LOVE, SHREK IS LIFE
+            to_return["image_size"] = image_size
+
+            # seek to timestamp and read
+            _discard = self._file.read(image_size)
+            to_return["timestamp"] = struct.unpack("<" + LONG, self._file.read(4))[0]
+            to_return["timestamp_ms"] = struct.unpack("<" + SHORT, self._file.read(2))[
+                0
+            ]
+            to_return["timestamp_us"] = struct.unpack("<" + SHORT, self._file.read(2))[
+                0
+            ]
+
+            yield to_return
+
+    @staticmethod
+    def _yield_idx_chunks(file, fields):
+        filesize = os.fstat(file.fileno()).st_size
+        while file.tell() < filesize:
+            to_return = {}
+            for field_name, field_type in fields:
+                s = struct.Struct("<" + field_type)
+                values = s.unpack(file.read(s.size))
+                if len(values) == 1:
+                    to_return[field_name] = values[0]
+                else:
+                    to_return[field_name] = values
+
+            # idx file stores JPEG data size + 4 for some reason;
+            # clean up to make it useful for reading data
+            to_return["image_size"] -= 4
+            yield to_return
+
+    # reads header fields from file
     def _read_header(self, fields, offset=0):
         self._file.seek(offset)
         tmp = dict()
@@ -488,6 +572,7 @@ class NorpixJPEGSeq(FramesSequence):
 
         return tmp
 
+    # used in unpacking header structs
     def _unpack(self, fs, offset=None):
         if offset is not None:
             self._file.seek(offset)
@@ -498,6 +583,7 @@ class NorpixJPEGSeq(FramesSequence):
         else:
             return vals
 
+    # used when getting time or frame data
     def _verify_frame_no(self, i):
         if int(i) != i:
             raise ValueError("Frame numbers can only be integers")
@@ -509,29 +595,54 @@ class NorpixJPEGSeq(FramesSequence):
         # available
         self._validate_process_func(process_func)
 
+    # this method should be present when inheriting from FramesSequence
+    # TODO ADAPT TO READING JPEGS
     def get_frame(self, i):
         self._verify_frame_no(i)
         with FileLocker(self._file_lock):
-            self._file.seek(self._image_offset + self._image_block_size * i)
-            imdata = np.fromfile(
-                self._file, self.pixel_type, self._pixel_count
-            ).reshape(self._shape)
-            # Timestamp immediately follows
-            tfloat, ts = self._read_timestamp()
+            # seek to the offset of the frame we want
+            # "offset" is the start of the data block;
+            # + 4 to skip the first 4 bytes containing the size of the JPEG data
+            jpeg_data_offset = self._sequence_index[i]["offset"] + 4
+            self._file.seek(jpeg_data_offset)
+
+            # read the JPEG data bytes with opencv
+            jpeg_data_buffer = io.BytesIO(
+                self._file.read(self._sequence_index[i]["image_size"])
+            )
+            jpeg_data_buffer.seek(0)
+
+            # get buffer length and check if this is according to the frame index
+            buffer_length = jpeg_data_buffer.getbuffer().nbytes
+            assert buffer_length == self._sequence_index[i]["image_size"], (
+                f"Unexpected number of bytes read from file: "
+                f"expected {self._sequence_index[i]['image_size']} bytes, "
+                f"got {buffer_length} bytes"
+            )
+
+            # open with Pillow and convert to numpy array
+            pil_image = Image.open(jpeg_data_buffer)
+            imdata = np.array(pil_image)
+
+            # get timestamp as float and as python datetime object from index
+            tfloat, ts = self._read_timestamp(i)
+
+            # prepare metadata
             md = {"time": ts, "time_float": tfloat, "gamut": self.metadata["gamut"]}
+
             return Frame(imdata, frame_no=i, metadata=md)
 
-    def _read_timestamp(self):
+    def _read_timestamp(self, i):
         """Read a timestamp at the current position in the file.
 
         Returns a floating-point representation in seconds, and a datetime instance.
         """
-        if self._timestamp_micro:
-            tsecs, tms, tus = self._timestamp_struct.unpack(self._file.read(8))
-            tfloat = tsecs + float(tms) / 1000.0 + float(tus) / 1.0e6
-        else:
-            tsecs, tms = self._timestamp_struct.unpack(self._file.read(6))
-            tfloat = tsecs + float(tms) / 1000.0
+        tsecs = self._sequence_index[i]["timestamp"]
+        tms = self._sequence_index[i]["timestamp_ms"]
+        tus = self._sequence_index[i]["timestamp_us"]
+
+        tfloat = tsecs + float(tms) / 1000.0 + float(tus) / 1.0e6
+
         return tfloat, datetime.datetime.fromtimestamp(tfloat)
 
     def _get_time(self, i):

@@ -20,6 +20,7 @@ setup_parameters = dict(
         'imageio',
         'numpy>=1.19',
         'slicerator>=0.9.8',
+        'Pillow==9.2.0'
     ],
     author_email="dallan@pha.jhu.edu",
     url="https://github.com/soft-matter/pims",
