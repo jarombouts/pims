@@ -1,3 +1,4 @@
+.python-version
 *.pro
 *.log
 *.py[cod]
@@ -39,3 +40,5 @@ MANIFEST
 doc/build
 sample_norpix5.seq
 PIMS.egg-info/
+.DS_Store
+*seq*
